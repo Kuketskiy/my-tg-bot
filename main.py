@@ -3,6 +3,8 @@ import sys
 import asyncio
 import shutil
 import base64
+import static_ffmpeg
+static_ffmpeg.add_paths()
 
 # Принудительно устанавливаем UTF-8 для всей консоли Windows
 os.environ["PYTHONIOENCODING"] = "utf-8"
