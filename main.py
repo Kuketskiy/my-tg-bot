@@ -22,6 +22,9 @@ from openai import AsyncOpenAI
 from icrawler.builtin import BingImageCrawler
 from aiohttp import web
 
+import speech_recognition as sr
+from pydub import AudioSegment
+
 import database as db
 
 if not os.path.exists("temp_voice"):
@@ -30,7 +33,6 @@ if not os.path.exists("temp_voice"):
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-DEEPINFRA_API_KEY = os.getenv("DEEPINFRA_API_KEY")
 
 SECRET_PASSWORD = "Unity101_a"
 ADMIN_ID = 7390257609
@@ -44,13 +46,7 @@ ai_client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1"
 )
 
-# Клиент DeepInfra для Whisper (ГС)
-deepinfra_client = AsyncOpenAI(
-    api_key=DEEPINFRA_API_KEY,
-    base_url="https://api.deepinfra.com/v1/openai"
-)
-
-# --- ИСПРАВЛЕННЫЙ СИСТЕМНЫЙ ПРОМПТ ---
+# --- АДЕКВАТНЫЙ СИСТЕМНЫЙ ПРОМПТ ---
 BASE_SYSTEM_INSTRUCTION = (
     "Ты — общительный, адекватный и современный ИИ-помощник в Telegram. "
     "ОТВЕЧАЙ МАКСИМАЛЬНО КРАТКО, ЧЕТКО И ПО ДЕЛУ (1-3 предложения). "
@@ -185,54 +181,31 @@ async def summarize_user_history_handler(message: Message):
         pass
 
 async def transcribe_voice(file_path: str) -> str:
+    """Бесплатное распознавание ГС через Google Speech Recognition"""
+    wav_path = file_path.replace(".ogg", ".wav")
     try:
-        with open(file_path, "rb") as audio_file:
-            transcript = await deepinfra_client.audio.transcriptions.create(
-                model="openai/whisper-large-v3",
-                file=audio_file
+        sound = AudioSegment.from_file(file_path)
+        sound.export(wav_path, format="wav")
+
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source)
+            text = await asyncio.to_thread(
+                recognizer.recognize_google, audio_data, language="ru-RU"
             )
-        return transcript.text
-    except Exception as e:
-        print(f"Whisper Error: {repr(e)}")
+            return text
+    except sr.UnknownValueError:
+        print("Google Speech не смог разобрать речь")
         return None
-
-async def translate_prompt_ai(text: str) -> str:
-    """Безопасный перевод через DeepSeek"""
-    try:
-        response = await ai_client.chat.completions.create(
-            model="deepseek/deepseek-chat",
-            messages=[
-                {"role": "system", "content": "Translate the user's text into a concise English image generation prompt. Output ONLY the English text."},
-                {"role": "user", "content": text}
-            ],
-            max_tokens=150
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"AI Translation Error: {repr(e)}")
-        return text
-
-async def generate_deepinfra_image(prompt: str, user_id: int) -> str:
-    image_path = f"gen_img_{user_id}.jpg"
-    try:
-        eng_prompt = await translate_prompt_ai(prompt)
-        response = await deepinfra_client.images.generate(
-            model="black-forest-labs/FLUX-1-schnell",
-            prompt=eng_prompt,
-            size="1024x1024",
-            n=1,
-            response_format="b64_json"
-        )
-        b64_data = response.data[0].b64_json
-        image_bytes = base64.b64decode(b64_data)
-        with open(image_path, "wb") as f:
-            f.write(image_bytes)
-        return image_path
-    except Exception as e:
-        print(f"DeepInfra Gen Error: {repr(e)}")
-        if os.path.exists(image_path):
-            os.remove(image_path)
+    except sr.RequestError as e:
+        print(f"Ошибка сервиса Google Speech: {e}")
         return None
+    except Exception as e:
+        print(f"Ошибка конвертации/обработки ГС: {repr(e)}")
+        return None
+    finally:
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
 def sync_bing_search(query: str, save_dir: str):
     crawler = BingImageCrawler(storage={'root_dir': save_dir}, log_level=50)
@@ -273,25 +246,9 @@ async def process_text_request(message: Message, text: str, is_voice: bool = Fal
             await send_user_list(message)
             return
 
+        # Если это ГС — первыми отправляем отдельное сообщение с расшифрованным текстом
         if is_voice:
-            await message.reply(f"🎤 _Распознано:_ \"{text}\"", parse_mode="Markdown")
-
-        gen_triggers = ("нарисуй", "рисуй", "создай", "сгенерируй")
-        if any(text_lower.startswith(trigger) for trigger in gen_triggers):
-            await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
-            prompt = text
-            for trigger in gen_triggers:
-                if text_lower.startswith(trigger):
-                    prompt = text[len(trigger):].strip().lstrip(":").strip()
-                    break
-            gen_file = await generate_deepinfra_image(prompt, user_id)
-            if gen_file and os.path.exists(gen_file):
-                await message.answer_photo(photo=FSInputFile(gen_file), caption=f"🎨 Сгенерировал: *{prompt}*", parse_mode="Markdown")
-                os.remove(gen_file)
-                return
-            else:
-                await message.answer("Сервер перегружен, попробуй чуть позже.")
-                return
+            await message.answer(f"🎤 **Расшифровка вашего ГС:**\n_\"{text}\"_", parse_mode="Markdown")
 
         search_triggers = ("кинь картинку", "найди картинку", "скинь картинку", "покажи картинку")
         if any(text_lower.startswith(trigger) for trigger in search_triggers):
@@ -325,6 +282,8 @@ async def process_text_request(message: Message, text: str, is_voice: bool = Fal
         answer_text = response.choices[0].message.content
         db.add_history(user_id, "user", text)
         db.add_history(user_id, "assistant", answer_text)
+        
+        # Отправляем ответ нейросети текстом
         await message.answer(answer_text)
 
     except TelegramForbiddenError:
@@ -341,14 +300,17 @@ async def handle_voice(message: Message):
     db.log_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     voice_path = f"temp_voice/voice_{message.from_user.id}_{message.message_id}.ogg"
     try:
-        await bot.send_chat_action(chat_id=message.chat.id, action="record_voice")
+        # Уведомляем пользователя, что бот слушае/обрабатывает аудио
+        await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+        
         file_info = await bot.get_file(message.voice.file_id)
         await bot.download_file(file_info.file_path, voice_path)
+        
         transcribed_text = await transcribe_voice(voice_path)
         if transcribed_text:
             await process_text_request(message, transcribed_text, is_voice=True)
         else:
-            await message.answer("Не удалось распознать голосовое сообщение.")
+            await message.answer("Не удалось разобрать речь в голосовом сообщении.")
     except TelegramForbiddenError:
         print(f"User {message.from_user.id} blocked bot.")
     except Exception as e:
@@ -368,7 +330,7 @@ async def handle_text(message: Message):
 
 async def main():
     asyncio.create_task(start_dummy_server())
-    print("Bot started on OpenRouter (DeepSeek)!")
+    print("Bot started with free Google Speech-to-Text & DeepSeek!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
