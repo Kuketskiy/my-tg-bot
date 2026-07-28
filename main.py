@@ -5,12 +5,13 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, FSInputFile, BotCommand
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from openai import AsyncOpenAI
 
 from yt_dlp import YoutubeDL
 from yt_dlp.postprocessor.common import PostProcessor
 
-# Загрузка токенов из .env
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -25,7 +26,14 @@ client = AsyncOpenAI(
 )
 
 # -------------------------------------------------------------------
-# Класс для перехвата имени скачанного файла из yt-dlp
+# Определение состояний (FSM)
+# -------------------------------------------------------------------
+class DownloadState(StatesGroup):
+    waiting_for_song_query = State()
+    waiting_for_video_query = State()
+
+# -------------------------------------------------------------------
+# Класс для yt-dlp
 # -------------------------------------------------------------------
 class FileNameCollectorPP(PostProcessor):
     def __init__(self):
@@ -36,11 +44,7 @@ class FileNameCollectorPP(PostProcessor):
         self.filenames.append(information.get('filepath'))
         return [], information
 
-# -------------------------------------------------------------------
-# Функция скачивания аудио/видео с YouTube
-# -------------------------------------------------------------------
 async def download_yt_content(query: str, is_video: bool = False):
-    """Ищет и скачивает трек (MP3) или видео (MP4) с YouTube"""
     loop = asyncio.get_event_loop()
     filename_collector = FileNameCollectorPP()
 
@@ -74,9 +78,6 @@ async def download_yt_content(query: str, is_video: bool = False):
 
     return await loop.run_in_executor(None, _download)
 
-# -------------------------------------------------------------------
-# Настройка синей кнопки «Меню» в Telegram
-# -------------------------------------------------------------------
 async def set_bot_commands():
     commands = [
         BotCommand(command="start", description="🚀 Перезапустить бота"),
@@ -87,78 +88,91 @@ async def set_bot_commands():
     await bot.set_my_commands(commands)
 
 # -------------------------------------------------------------------
-# Хэндлеры бота
+# Хэндлеры
 # -------------------------------------------------------------------
 @dp.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         "👋 **Привет! Я твой универсальный бот.**\n\n"
-        "Воспользуйся кнопкой **«Меню»** слева от поля ввода или введи символ `/` для просмотра всех команд.\n\n"
-        "• `/song <название>` — скачать аудио с YouTube\n"
-        "• `/video <название>` — скачать видео с YouTube\n"
-        "• Или просто напиши мне любой вопрос, и я отвечу!"
+        "• Выбери в меню `/song` или `/video`, и я спрошу название.\n"
+        "• Или просто напиши мне любой вопрос для ИИ."
     )
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
-        "📌 **Как пользоваться ботом:**\n\n"
-        "1. **Для поиска музыки:** отправь `/song Название трека` (например: `/song Queen Bohemian Rhapsody`)\n"
-        "2. **Для поиска видео:** отправь `/video Название ролике` (например: `/video funny cats`)\n"
-        "3. **Для общения с ИИ:** просто отправляй любой текст без команд."
+        "📌 **Как пользоваться:**\n"
+        "1. Нажми `/song` или `/video` в меню.\n"
+        "2. Бот попросит ввести название — просто отправь его текстом!\n"
+        "3. Любое другое сообщение пойдет на ответ ИИ."
     )
 
-# Поиск и скачивание МУЗЫКИ (/song)
+# --- Обработка клика по /song ---
 @dp.message(Command("song"))
-async def handle_song_cmd(message: Message):
+async def cmd_song_init(message: Message, state: FSMContext):
+    # Проверяем: пришел ли аргумент вместе с командой (например, /song Queen)
     args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("⚠️ Укажи название трека!\nПример: `/song I Will Survive`", parse_mode="Markdown")
-        return
+    if len(args) > 1:
+        await process_song_download(message, args[1], state)
+    else:
+        await state.set_state(DownloadState.waiting_for_song_query)
+        await message.answer("🎵 **Введи название песни или исполнителя:**")
 
-    query = args[1]
+# --- Обработка клика по /video ---
+@dp.message(Command("video"))
+async def cmd_video_init(message: Message, state: FSMContext):
+    args = message.text.split(maxsplit=1)
+    if len(args) > 1:
+        await process_video_download(message, args[1], state)
+    else:
+        await state.set_state(DownloadState.waiting_for_video_query)
+        await message.answer("🎬 **Введи название или тему видео:**")
+
+# --- Перехват ввода для СКАЧИВАНИЯ ПЕСНИ ---
+@dp.message(DownloadState.waiting_for_song_query)
+async def handle_song_input(message: Message, state: FSMContext):
+    await process_song_download(message, message.text, state)
+
+# --- Перехват ввода для СКАЧИВАНИЯ ВИДЕО ---
+@dp.message(DownloadState.waiting_for_video_query)
+async def handle_video_input(message: Message, state: FSMContext):
+    await process_video_download(message, message.text, state)
+
+# Вспомогательные функции отправки
+async def process_song_download(message: Message, query: str, state: FSMContext):
+    await state.clear()
     status_msg = await message.answer(f"🔎 Ищу и скачиваю песню: **{query}**...", parse_mode="Markdown")
-
     try:
         file_path = await download_yt_content(query, is_video=False)
-
         if file_path and os.path.exists(file_path):
             audio_file = FSInputFile(file_path)
             await message.answer_audio(audio=audio_file, caption=f"🎵 {query}")
             await status_msg.delete()
             os.remove(file_path)
         else:
-            await status_msg.edit_text("Не удалось найти или скачать трек.")
+            await status_msg.edit_text("Не удалось найти трек.")
     except Exception as e:
         print(f"Ошибка YT-DLP: {e}")
-        await status_msg.edit_text("Произошла ошибка при скачивании трека.")
+        await status_msg.edit_text("Ошибка при скачивании трека.")
 
-# Поиск и скачивание ВИДЕО (/video)
-@dp.message(Command("video"))
-async def handle_video_cmd(message: Message):
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("⚠️ Укажи название видео!\nПример: `/video смешные коты`", parse_mode="Markdown")
-        return
-
-    query = args[1]
+async def process_video_download(message: Message, query: str, state: FSMContext):
+    await state.clear()
     status_msg = await message.answer(f"🔎 Ищу и скачиваю видео: **{query}**...", parse_mode="Markdown")
-
     try:
         file_path = await download_yt_content(query, is_video=True)
-
         if file_path and os.path.exists(file_path):
             video_file = FSInputFile(file_path)
             await message.answer_video(video=video_file, caption=f"🎬 {query}")
             await status_msg.delete()
             os.remove(file_path)
         else:
-            await status_msg.edit_text("Не удалось найти или скачать видео.")
+            await status_msg.edit_text("Не удалось найти видео.")
     except Exception as e:
         print(f"Ошибка YT-DLP: {e}")
-        await status_msg.edit_text("Произошла ошибка при скачивании видео.")
+        await status_msg.edit_text("Ошибка при скачивании видео.")
 
-# Обычное текстовое общение с ИИ
+# --- Обычный диалог с ИИ (когда нет активных состояний скачивания) ---
 @dp.message(F.text)
 async def handle_text(message: Message):
     try:
@@ -192,16 +206,14 @@ async def handle_text(message: Message):
         await message.answer(f"Ошибка при запросе к AI: {e}")
 
 # -------------------------------------------------------------------
-# Запуск бота
+# Запуск
 # -------------------------------------------------------------------
 async def main():
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
     
-    # Регистрируем меню команд в Telegram при запуске
     await set_bot_commands()
-    
-    print("Бот успешно запущен! Меню команд обновлено.")
+    print("Бот успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
