@@ -1,15 +1,15 @@
 import os
-import json
 import asyncio
 import subprocess
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, FSInputFile
+from aiogram.filters import CommandStart
+from aiogram.types import Message
 from openai import AsyncOpenAI
 import speech_recognition as sr
 from pydub import AudioSegment
+from shazamio import Shazam
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -20,39 +20,21 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Инициализация клиента OpenAI (через OpenRouter)
 client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
 )
 
+shazam = Shazam()
+
 # -------------------------------------------------------------------
-# Функция распознавания музыки через системный songrec
+# Функция распознавания музыки через Shazamio
 # -------------------------------------------------------------------
 async def recognize_music(file_path: str):
-    """Распознает трек через консольную утилиту songrec (Shazam API)"""
-    wav_path = file_path + ".wav"
+    """Распознает трек через Shazam API"""
     try:
-        # Конвертируем исходное аудио в WAV для стабильного распознавания
-        proc_ffmpeg = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", file_path, "-ar", "44100", "-ac", "1", wav_path,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        await proc_ffmpeg.communicate()
-
-        # Вызываем songrec
-        cmd = await asyncio.create_subprocess_exec(
-            "songrec", "audio-file-to-recognized-song", wav_path,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        stdout, stderr = await cmd.communicate()
-
-        if not stdout:
-            return None
-
-        # Разбираем JSON ответа от Shazam
-        data = json.loads(stdout.decode("utf-8"))
-        track = data.get("track")
+        out = await shazam.recognize(file_path)
+        track = out.get("track")
         if not track:
             return None
 
@@ -66,23 +48,16 @@ async def recognize_music(file_path: str):
             "subtitle": subtitle,
             "cover_url": cover_url
         }
-
     except Exception as e:
-        print(f"Ошибка при работе SongRec: {repr(e)}")
+        print(f"Ошибка Shazamio: {repr(e)}")
         return None
 
-    finally:
-        # Удаляем временный wav файл
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
-
 # -------------------------------------------------------------------
-# Функция распознавания голоса в текст (SpeechRecognition + ffmpeg)
+# Функция распознавания голоса в текст
 # -------------------------------------------------------------------
 async def transcribe_voice(file_path: str) -> str:
     wav_path = file_path + ".wav"
     try:
-        # Конвертируем ogg/mp3/mp4 в wav (16kHz, mono)
         sound = AudioSegment.from_file(file_path)
         sound = sound.set_frame_rate(16000).set_channels(1)
         sound.export(wav_path, format="wav")
@@ -106,12 +81,10 @@ async def transcribe_voice(file_path: str) -> str:
 async def cmd_start(message: Message):
     await message.answer("Привет! Я готов к работе. Отправляй мне текстовые сообщения, голосовые или музыку для распознавания!")
 
-# Обработка голосовых сообщений и аудиофайлов
 @dp.message(F.voice | F.audio | F.video_note)
 async def handle_audio(message: Message):
     status_msg = await message.answer("🔎 Анализирую аудио...")
     
-    # Скачиваем файл во временное хранилище
     file_id = message.voice.file_id if message.voice else (
         message.audio.file_id if message.audio else message.video_note.file_id
     )
@@ -120,7 +93,7 @@ async def handle_audio(message: Message):
     await bot.download_file(file.file_path, file_path)
 
     try:
-        # 1. Пробуем распознать как музыку через SongRec
+        # 1. Пробуем распознать музыку
         music_info = await recognize_music(file_path)
         
         if music_info:
@@ -132,19 +105,18 @@ async def handle_audio(message: Message):
             await status_msg.delete()
             return
 
-        # 2. Если это не музыка и сообщение голосовое — расшифровываем в текст для нейросети
+        # 2. Если это голосовое и не музыка — переводим в текст
         if message.voice or message.video_note:
             text = await transcribe_voice(file_path)
             if text:
                 await status_msg.edit_text(f"🗣 **Вы сказали:** _{text}_\n\nДумаю над ответом...", parse_mode="Markdown")
-                # Отправляем распознанный текст нейросети DeepSeek
                 response = await client.chat.completions.create(
                     model="deepseek/deepseek-chat",
                     messages=[{"role": "user", "content": text}]
                 )
                 await message.answer(response.choices[0].message.content)
             else:
-                await status_msg.edit_text("Не удалось распознать речь или аудио слишком тихое.")
+                await status_msg.edit_text("Не удалось распознать речь или музыка не найдена.")
         else:
             await status_msg.edit_text("Музыка в файле не найдена.")
 
@@ -156,7 +128,6 @@ async def handle_audio(message: Message):
         if os.path.exists(file_path):
             os.remove(file_path)
 
-# Обработка обычных текстовых сообщений
 @dp.message(F.text)
 async def handle_text(message: Message):
     try:
@@ -168,7 +139,6 @@ async def handle_text(message: Message):
     except Exception as e:
         await message.answer(f"Ошибка при запросе к AI: {e}")
 
-# Запуск бота
 async def main():
     print("Бот успешно запущен!")
     await dp.start_polling(bot)
