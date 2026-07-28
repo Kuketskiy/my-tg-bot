@@ -27,27 +27,33 @@ client = AsyncOpenAI(
 )
 
 # -------------------------------------------------------------------
-# Функция распознавания музыки через прямой веб-запрос (без shazamio_core)
+# Функция распознавания музыки (Прямой HTTP-запрос к Shazam)
 # -------------------------------------------------------------------
 async def recognize_music(file_path: str):
-    raw_path = file_path + ".raw"
+    """Конвертирует аудио в моно WAV 16kHz и отправляет в Shazam API"""
+    wav_path = file_path + "_shazam.wav"
     try:
+        # Конвертируем входной файл в WAV (16000 Hz, mono) через ffmpeg
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-i", file_path,
-            "-f", "s16le", "-ac", "1", "-ar", "44100", raw_path,
+            "-ar", "16000", "-ac", "1", "-f", "wav", wav_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         await proc.communicate()
 
-        if not os.path.exists(raw_path):
+        if not os.path.exists(wav_path):
             return None
 
         async with aiohttp.ClientSession() as session:
-            with open(raw_path, "rb") as f:
-                audio_bytes = f.read()
+            with open(wav_path, "rb") as f:
+                # Читаем сэмпл файла
+                audio_bytes = f.read(500000)
 
             url = "https://amp.shazam.com/discovery/v5/ru/RU/android/-/tag/sample"
-            headers = {"Content-Type": "application/octet-stream"}
+            headers = {
+                "User-Agent": "Shazam/11.7.0 (Android; arm64-v8a)",
+                "Content-Type": "application/octet-stream"
+            }
             
             async with session.post(url, data=audio_bytes, headers=headers) as resp:
                 if resp.status != 200:
@@ -64,14 +70,14 @@ async def recognize_music(file_path: str):
             "cover_url": track.get("images", {}).get("coverarthq") or track.get("images", {}).get("coverart")
         }
     except Exception as e:
-        print(f"Ошибка распознавания музыки: {e}")
+        print(f"Ошибка Shazam: {e}")
         return None
     finally:
-        if os.path.exists(raw_path):
-            os.remove(raw_path)
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
 # -------------------------------------------------------------------
-# Функция распознавания голоса в текст
+# Функция распознавания голоса в текст (Google Speech Recognition)
 # -------------------------------------------------------------------
 async def transcribe_voice(file_path: str) -> str:
     wav_path = file_path + ".wav"
@@ -98,6 +104,7 @@ async def transcribe_voice(file_path: str) -> str:
 async def cmd_start(message: Message):
     await message.answer("Привет! Я готов к работе. Отправляй мне текстовые сообщения, голосовые или музыку для распознавания!")
 
+# Обработка голосовых сообщений, аудиофайлов и видео-записок
 @dp.message(F.voice | F.audio | F.video_note)
 async def handle_audio(message: Message):
     status_msg = await message.answer("🔎 Анализирую аудио...")
@@ -110,6 +117,7 @@ async def handle_audio(message: Message):
     await bot.download_file(file.file_path, file_path)
 
     try:
+        # 1. Сначала пробуем распознать как музыку
         music_info = await recognize_music(file_path)
         
         if music_info:
@@ -121,19 +129,32 @@ async def handle_audio(message: Message):
             await status_msg.delete()
             return
 
+        # 2. Если трек не найден и это голосовое — переводим в текст для нейросети
         if message.voice or message.video_note:
             text = await transcribe_voice(file_path)
             if text:
-                await status_msg.edit_text(f"🗣 **Вы сказали:** _{text}_\n\nДумаю над ответом...", parse_mode="Markdown")
-                
-                # Включаем статус печати перед запросом к нейросети
+                await status_msg.edit_text(f"🗣 **Вы сказали:** _{text}_\n\nГенерирую ответ...", parse_mode="Markdown")
                 await bot.send_chat_action(message.chat.id, "typing")
                 
-                response = await client.chat.completions.create(
+                # Запрос к нейросети со стримингом
+                response_stream = await client.chat.completions.create(
                     model="deepseek/deepseek-chat",
-                    messages=[{"role": "user", "content": text}]
+                    messages=[{"role": "user", "content": text}],
+                    stream=True
                 )
-                await message.answer(response.choices[0].message.content)
+                
+                full_text = ""
+                last_len = 0
+                async for chunk in response_stream:
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        full_text += content
+                        if len(full_text) - last_len > 25:
+                            await status_msg.edit_text(f"🗣 **Вы сказали:** _{text}_\n\n{full_text}")
+                            last_len = len(full_text)
+                
+                if len(full_text) != last_len:
+                    await status_msg.edit_text(f"🗣 **Вы сказали:** _{text}_\n\n{full_text}")
             else:
                 await status_msg.edit_text("Не удалось распознать речь или музыка не найдена.")
         else:
@@ -147,20 +168,44 @@ async def handle_audio(message: Message):
         if os.path.exists(file_path):
             os.remove(file_path)
 
+# Обработка обычных текстовых сообщений
 @dp.message(F.text)
 async def handle_text(message: Message):
     try:
-        # Включаем статус "печатает..." сразу, как пришло сообщение
         await bot.send_chat_action(message.chat.id, "typing")
         
-        response = await client.chat.completions.create(
+        response_stream = await client.chat.completions.create(
             model="deepseek/deepseek-chat",
-            messages=[{"role": "user", "content": message.text}]
+            messages=[{"role": "user", "content": message.text}],
+            stream=True
         )
-        await message.answer(response.choices[0].message.content)
+
+        sent_message = None
+        full_text = ""
+        last_updated_len = 0
+
+        async for chunk in response_stream:
+            content = chunk.choices[0].delta.content
+            if content:
+                full_text += content
+                
+                # Отправляем сообщение при появлении первых символов
+                if not sent_message:
+                    sent_message = await message.answer(full_text)
+                    last_updated_len = len(full_text)
+                # Дописываем текст пачками (чтобы не превысить лимиты API Telegram)
+                elif len(full_text) - last_updated_len > 20:
+                    await sent_message.edit_text(full_text)
+                    last_updated_len = len(full_text)
+
+        # Финальное редактирование сообщения
+        if sent_message and len(full_text) != last_updated_len:
+            await sent_message.edit_text(full_text)
+
     except Exception as e:
         await message.answer(f"Ошибка при запросе к AI: {e}")
 
+# Запуск бота
 async def main():
     print("Бот успешно запущен!")
     await dp.start_polling(bot)
