@@ -1,6 +1,8 @@
 import os
+import json
 import asyncio
 import subprocess
+import aiohttp
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
@@ -9,7 +11,6 @@ from aiogram.types import Message
 from openai import AsyncOpenAI
 import speech_recognition as sr
 from pydub import AudioSegment
-from shazamio import Shazam
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -25,16 +26,39 @@ client = AsyncOpenAI(
     api_key=OPENROUTER_API_KEY,
 )
 
-shazam = Shazam()
-
 # -------------------------------------------------------------------
-# Функция распознавания музыки через Shazamio
+# Функция распознавания музыки через прямой веб-запрос (без shazamio_core)
 # -------------------------------------------------------------------
 async def recognize_music(file_path: str):
-    """Распознает трек через Shazam API"""
+    """Конвертирует аудио и распознает через публичный эндпоинт Shazam"""
+    raw_path = file_path + ".raw"
     try:
-        out = await shazam.recognize(file_path)
-        track = out.get("track")
+        # Конвертируем аудио с помощью ffmpeg в raw PCM (44100Hz, mono, 16-bit le)
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", file_path,
+            "-f", "s16le", "-ac", "1", "-ar", "44100", raw_path,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        await proc.communicate()
+
+        if not os.path.exists(raw_path):
+            return None
+
+        # Отправляем сформированный сырой поток в бесплатный распознаватель
+        async with aiohttp.ClientSession() as session:
+            with open(raw_path, "rb") as f:
+                audio_bytes = f.read()
+
+            # Отправляем байты на сервис
+            url = "https://amp.shazam.com/discovery/v5/ru/RU/android/-/tag/sample"
+            headers = {"Content-Type": "application/octet-stream"}
+            
+            async with session.post(url, data=audio_bytes, headers=headers) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+
+        track = data.get("track")
         if not track:
             return None
 
@@ -49,8 +73,11 @@ async def recognize_music(file_path: str):
             "cover_url": cover_url
         }
     except Exception as e:
-        print(f"Ошибка Shazamio: {repr(e)}")
+        print(f"Ошибка распознавания музыки: {e}")
         return None
+    finally:
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
 
 # -------------------------------------------------------------------
 # Функция распознавания голоса в текст
@@ -105,7 +132,7 @@ async def handle_audio(message: Message):
             await status_msg.delete()
             return
 
-        # 2. Если это голосовое и не музыка — переводим в текст
+        # 2. Если это голосовое и не музыка — переводим в текст для AI
         if message.voice or message.video_note:
             text = await transcribe_voice(file_path)
             if text:
