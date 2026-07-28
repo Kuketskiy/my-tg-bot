@@ -30,10 +30,8 @@ client = AsyncOpenAI(
 # Функция распознавания музыки через прямой веб-запрос (без shazamio_core)
 # -------------------------------------------------------------------
 async def recognize_music(file_path: str):
-    """Конвертирует аудио и распознает через публичный эндпоинт Shazam"""
     raw_path = file_path + ".raw"
     try:
-        # Конвертируем аудио с помощью ffmpeg в raw PCM (44100Hz, mono, 16-bit le)
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-i", file_path,
             "-f", "s16le", "-ac", "1", "-ar", "44100", raw_path,
@@ -44,12 +42,10 @@ async def recognize_music(file_path: str):
         if not os.path.exists(raw_path):
             return None
 
-        # Отправляем сформированный сырой поток в бесплатный распознаватель
         async with aiohttp.ClientSession() as session:
             with open(raw_path, "rb") as f:
                 audio_bytes = f.read()
 
-            # Отправляем байты на сервис
             url = "https://amp.shazam.com/discovery/v5/ru/RU/android/-/tag/sample"
             headers = {"Content-Type": "application/octet-stream"}
             
@@ -62,15 +58,10 @@ async def recognize_music(file_path: str):
         if not track:
             return None
 
-        title = track.get("title", "Неизвестное название")
-        subtitle = track.get("subtitle", "Неизвестный исполнитель")
-        images = track.get("images", {})
-        cover_url = images.get("coverarthq") or images.get("coverart")
-
         return {
-            "title": title,
-            "subtitle": subtitle,
-            "cover_url": cover_url
+            "title": track.get("title", "Неизвестное название"),
+            "subtitle": track.get("subtitle", "Неизвестный исполнитель"),
+            "cover_url": track.get("images", {}).get("coverarthq") or track.get("images", {}).get("coverart")
         }
     except Exception as e:
         print(f"Ошибка распознавания музыки: {e}")
@@ -92,8 +83,7 @@ async def transcribe_voice(file_path: str) -> str:
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_path) as source:
             audio_data = recognizer.record(source)
-            text = recognizer.recognize_google(audio_data, language="ru-RU")
-            return text
+            return recognizer.recognize_google(audio_data, language="ru-RU")
     except Exception as e:
         print(f"Ошибка распознавания речи: {e}")
         return ""
@@ -120,7 +110,6 @@ async def handle_audio(message: Message):
     await bot.download_file(file.file_path, file_path)
 
     try:
-        # 1. Пробуем распознать музыку
         music_info = await recognize_music(file_path)
         
         if music_info:
@@ -132,11 +121,14 @@ async def handle_audio(message: Message):
             await status_msg.delete()
             return
 
-        # 2. Если это голосовое и не музыка — переводим в текст для AI
         if message.voice or message.video_note:
             text = await transcribe_voice(file_path)
             if text:
                 await status_msg.edit_text(f"🗣 **Вы сказали:** _{text}_\n\nДумаю над ответом...", parse_mode="Markdown")
+                
+                # Включаем статус печати перед запросом к нейросети
+                await bot.send_chat_action(message.chat.id, "typing")
+                
                 response = await client.chat.completions.create(
                     model="deepseek/deepseek-chat",
                     messages=[{"role": "user", "content": text}]
@@ -158,6 +150,9 @@ async def handle_audio(message: Message):
 @dp.message(F.text)
 async def handle_text(message: Message):
     try:
+        # Включаем статус "печатает..." сразу, как пришло сообщение
+        await bot.send_chat_action(message.chat.id, "typing")
+        
         response = await client.chat.completions.create(
             model="deepseek/deepseek-chat",
             messages=[{"role": "user", "content": message.text}]
