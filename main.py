@@ -306,9 +306,11 @@ async def process_text_request(message: Message, text: str, is_voice: bool = Fal
                 shutil.rmtree(os.path.dirname(img_file))
                 return
 
+        # Сразу отправляем статус "печатает"
         await bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
-        user_history = db.get_history(user_id, limit=10)
+        # Ограничили историю до 4 сообщений, чтобы запрос обрабатывался намного быстрее
+        user_history = db.get_history(user_id, limit=4)
         messages = [{"role": "system", "content": BASE_SYSTEM_INSTRUCTION}]
         for h in user_history:
             messages.append({"role": h["role"], "content": h["content"]})
@@ -317,7 +319,7 @@ async def process_text_request(message: Message, text: str, is_voice: bool = Fal
         response = await ai_client.chat.completions.create(
             model="deepseek/deepseek-chat",
             messages=messages,
-            max_tokens=250,
+            max_tokens=120,  # Зажимаем длину ответа
             temperature=0.7
         )
 
