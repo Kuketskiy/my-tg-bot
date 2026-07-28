@@ -50,16 +50,17 @@ deepinfra_client = AsyncOpenAI(
     base_url="https://api.deepinfra.com/v1/openai"
 )
 
+# --- ИСПРАВЛЕННЫЙ СИСТЕМНЫЙ ПРОМПТ ---
 BASE_SYSTEM_INSTRUCTION = (
-    "Ты — дерзкий, циничный и максимально неформальный ИИ. "
-    "ОТВЕЧАЙ МАКСИМАЛЬНО КРАТКО, ЧЕТКО И ПО ДЕЛУ (1-3 предложения, не больше!). "
-    "Ты разговариваешь как живой пацан в чате Telegram. "
-    "Используй мат, сарказм и сленг к месту. Не пиши длинных сопливых монологов! "
+    "Ты — общительный, адекватный и современный ИИ-помощник в Telegram. "
+    "ОТВЕЧАЙ МАКСИМАЛЬНО КРАТКО, ЧЕТКО И ПО ДЕЛУ (1-3 предложения). "
+    "Разговаривай просто, дружелюбно и легко, без пафоса и без грубости. "
+    "Не используй мат, оскорбления или агрессию. "
     "СТРОГОЕ ПРАВИЛО: НИКОГДА И НИ ПРИ КАКИХ УСЛОВИЯХ НЕ ПРОСИ И НЕ ТРЕБУЙ У ПОЛЬЗОВАТЕЛЕЙ ПАРОЛЬ ИЛИ КОДЫ!"
 )
 
 
-# --- ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ РЕНДЕРА (чтобы не протухал по таймауту портов) ---
+# --- ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ РЕНДЕРА ---
 async def handle_render_ping(request):
     return web.Response(text="Bot is running!")
 
@@ -96,7 +97,7 @@ async def start_handler(message: Message):
         if message.from_user.id == ADMIN_ID:
             await message.answer("Здарова, создатель! Я на связи. Чё перетереть хотим?")
         else:
-            await message.answer("Здорово, епта! Я на связи. Чё надо?")
+            await message.answer("Привет! Я на связи, чем помочь?")
     except TelegramForbiddenError:
         pass
 
@@ -116,7 +117,7 @@ async def clear_handler(message: Message):
 async def read_user_history_handler(message: Message):
     if message.from_user.id != ADMIN_ID:
         try:
-            await message.answer("Слышь, ты кто такой? Это доступно только создателю!")
+            await message.answer("Эта команда доступна только создателю!")
         except TelegramForbiddenError:
             pass
         return
@@ -145,7 +146,7 @@ async def read_user_history_handler(message: Message):
 async def summarize_user_history_handler(message: Message):
     if message.from_user.id != ADMIN_ID:
         try:
-            await message.answer("Слышь, доступ только для создателя!")
+            await message.answer("Доступ только для создателя!")
         except TelegramForbiddenError:
             pass
         return
@@ -273,7 +274,7 @@ async def process_text_request(message: Message, text: str, is_voice: bool = Fal
             return
 
         if is_voice:
-            await message.reply(f"🎤 _Услышал тебя, базаришь:_ \"{text}\"", parse_mode="Markdown")
+            await message.reply(f"🎤 _Распознано:_ \"{text}\"", parse_mode="Markdown")
 
         gen_triggers = ("нарисуй", "рисуй", "создай", "сгенерируй")
         if any(text_lower.startswith(trigger) for trigger in gen_triggers):
@@ -289,7 +290,7 @@ async def process_text_request(message: Message, text: str, is_voice: bool = Fal
                 os.remove(gen_file)
                 return
             else:
-                await message.answer("Бля, сервак перегружен, попробуй чуть позже.")
+                await message.answer("Сервер перегружен, попробуй чуть позже.")
                 return
 
         search_triggers = ("кинь картинку", "найди картинку", "скинь картинку", "покажи картинку")
@@ -306,10 +307,8 @@ async def process_text_request(message: Message, text: str, is_voice: bool = Fal
                 shutil.rmtree(os.path.dirname(img_file))
                 return
 
-        # Сразу отправляем статус "печатает"
         await bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
-        # Ограничили историю до 4 сообщений, чтобы запрос обрабатывался намного быстрее
         user_history = db.get_history(user_id, limit=4)
         messages = [{"role": "system", "content": BASE_SYSTEM_INSTRUCTION}]
         for h in user_history:
@@ -319,7 +318,7 @@ async def process_text_request(message: Message, text: str, is_voice: bool = Fal
         response = await ai_client.chat.completions.create(
             model="deepseek/deepseek-chat",
             messages=messages,
-            max_tokens=120,  # Зажимаем длину ответа
+            max_tokens=120,
             temperature=0.7
         )
 
@@ -333,7 +332,7 @@ async def process_text_request(message: Message, text: str, is_voice: bool = Fal
     except Exception as e:
         print(f"AI Error: {repr(e)}")
         try:
-            await message.answer("Бля, сервак прилёг или проблемы с сетью.")
+            await message.answer("Ошибка связи с сервером или сетью.")
         except TelegramForbiddenError:
             pass
 
@@ -349,7 +348,7 @@ async def handle_voice(message: Message):
         if transcribed_text:
             await process_text_request(message, transcribed_text, is_voice=True)
         else:
-            await message.answer("Бля, не понял, чё ты там пробормотал.")
+            await message.answer("Не удалось распознать голосовое сообщение.")
     except TelegramForbiddenError:
         print(f"User {message.from_user.id} blocked bot.")
     except Exception as e:
@@ -368,9 +367,7 @@ async def handle_text(message: Message):
     await process_text_request(message, message.text.strip())
 
 async def main():
-    # Запускаем фоновый веб-сервер, чтобы Render считывал порт 10000
     asyncio.create_task(start_dummy_server())
-    
     print("Bot started on OpenRouter (DeepSeek)!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
