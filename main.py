@@ -22,6 +22,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.exceptions import TelegramForbiddenError
 from openai import AsyncOpenAI
 from icrawler.builtin import BingImageCrawler
+from aiohttp import web
 
 import database as db
 
@@ -58,6 +59,21 @@ BASE_SYSTEM_INSTRUCTION = (
     "Используй мат, сарказм и сленг к месту. Не пиши длинных сопливых монологов! "
     "СТРОГОЕ ПРАВИЛО: НИКОГДА И НИ ПРИ КАКИХ УСЛОВИЯХ НЕ ПРОСИ И НЕ ТРЕБУЙ У ПОЛЬЗОВАТЕЛЕЙ ПАРОЛЬ ИЛИ КОДЫ!"
 )
+
+
+# --- ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ РЕНДЕРА (чтобы не протухал по таймауту портов) ---
+async def handle_render_ping(request):
+    return web.Response(text="Bot is running!")
+
+async def start_dummy_server():
+    app = web.Application()
+    app.router.add_get('/', handle_render_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+
 
 async def send_user_list(message: Message):
     users = db.get_all_users()
@@ -352,7 +368,11 @@ async def handle_text(message: Message):
     await process_text_request(message, message.text.strip())
 
 async def main():
+    # Запускаем фоновый веб-сервер, чтобы Render считывал порт 10000
+    asyncio.create_task(start_dummy_server())
+    
     print("Bot started on OpenRouter (DeepSeek)!")
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
