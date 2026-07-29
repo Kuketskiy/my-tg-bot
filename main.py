@@ -4,7 +4,8 @@ from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, FSInputFile, BotCommand
+from aiogram.types import Message, FSInputFile, BotCommand, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramForbiddenError, TelegramAPIError
@@ -34,7 +35,7 @@ class DownloadState(StatesGroup):
     waiting_for_video_query = State()
 
 # -------------------------------------------------------------------
-# Перехватчик файлов yt-dlp
+# Перехватчик имен файлов yt-dlp
 # -------------------------------------------------------------------
 class FileNameCollectorPP(PostProcessor):
     def __init__(self):
@@ -46,9 +47,9 @@ class FileNameCollectorPP(PostProcessor):
         return [], information
 
 # -------------------------------------------------------------------
-# Скачивание медиа
+# Функция скачивания медиа
 # -------------------------------------------------------------------
-async def download_yt_content(query: str, is_video: bool = False):
+async def download_media(target: str, quality: str = None, is_audio: bool = False):
     loop = asyncio.get_event_loop()
     filename_collector = FileNameCollectorPP()
 
@@ -57,16 +58,11 @@ async def download_yt_content(query: str, is_video: bool = False):
         'outtmpl': 'downloads/%(title)s.%(ext)s',
         'quiet': True,
         'ignoreerrors': True,
-        'max_filesize': 50 * 1024 * 1024, # Лимит 50 МБ для Telegram
+        'max_filesize': 50 * 1024 * 1024, # Лимит Telegram
         'match_filter': lambda info, incomplete: None if not info.get('age_limit') else 'Skip age restricted',
     }
 
-    if is_video:
-        ydl_opts = {
-            **base_opts,
-            'format': 'bestvideo[ext=mp4][filesize<=50M]+bestaudio[ext=m4a]/best[ext=mp4][filesize<=50M]/best',
-        }
-    else:
+    if is_audio:
         ydl_opts = {
             **base_opts,
             'format': 'bestaudio/best',
@@ -76,11 +72,22 @@ async def download_yt_content(query: str, is_video: bool = False):
                 'preferredquality': '192',
             }],
         }
+    else:
+        # Выбор качества видео по высоте (height)
+        height = quality if quality else "720"
+        fmt_str = f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]/best'
+        ydl_opts = {
+            **base_opts,
+            'format': fmt_str,
+        }
+
+    # Если передана не ссылка, а поисковый запрос
+    url_or_search = target if target.startswith("http") else f"ytsearch1:{target}"
 
     def _download():
         with YoutubeDL(ydl_opts) as ydl:
             ydl.add_post_processor(filename_collector)
-            ydl.download([f"ytsearch1:{query}"])
+            ydl.download([url_or_search])
         if filename_collector.filenames:
             return filename_collector.filenames[0]
         return None
@@ -88,19 +95,37 @@ async def download_yt_content(query: str, is_video: bool = False):
     return await loop.run_in_executor(None, _download)
 
 # -------------------------------------------------------------------
-# Установка меню
+# Клавиатура выбора качества
+# -------------------------------------------------------------------
+def get_quality_keyboard(query: str):
+    builder = InlineKeyboardBuilder()
+    
+    # Резаем query, чтобы не превысить лимит callback_data (64 байта)
+    short_q = query[:30]
+    
+    builder.button(text="🎬 1080p", callback_data=f"vid:1080:{short_q}")
+    builder.button(text="🎬 720p", callback_data=f"vid:720:{short_q}")
+    builder.button(text="🎬 480p", callback_data=f"vid:480:{short_q}")
+    builder.button(text="🎬 360p", callback_data=f"vid:360:{short_q}")
+    builder.button(text="🎵 Аудио (MP3)", callback_data=f"aud:mp3:{short_q}")
+    
+    builder.adjust(2)
+    return builder.as_markup()
+
+# -------------------------------------------------------------------
+# Настройка меню команд
 # -------------------------------------------------------------------
 async def set_bot_commands():
     commands = [
         BotCommand(command="start", description="🚀 Перезапустить бота"),
         BotCommand(command="song", description="🎵 Скачать песню (MP3)"),
-        BotCommand(command="video", description="🎬 Скачать видео (MP4)"),
+        BotCommand(command="video", description="🎬 Скачать видео (с выбором качества)"),
         BotCommand(command="help", description="ℹ️ Инструкция"),
     ]
     await bot.set_my_commands(commands)
 
 # -------------------------------------------------------------------
-# Глобальный перехватчик ошибок блокировки
+# Перехватчик ошибок блокировки бота
 # -------------------------------------------------------------------
 @dp.error()
 async def global_error_handler(event: types.ErrorEvent):
@@ -109,103 +134,126 @@ async def global_error_handler(event: types.ErrorEvent):
         return True
 
 # -------------------------------------------------------------------
-# Команды
+# Базовые команды
 # -------------------------------------------------------------------
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "👋 **Привет! Я твой универсальный бот.**\n\n"
-        "• Выбери в меню `/song` или `/video`, и я спрошу название.\n"
-        "• Или просто напиши мне любой вопрос для ИИ."
+        "👋 **Привет! Я бот для медиа и общения.**\n\n"
+        "• `/video` — Скачать видео с YouTube с выбором качества.\n"
+        "• `/song` — Скачать музыку в MP3.\n"
+        "• Или просто напиши любой вопрос, и ответит **DeepSeek-V3**."
     )
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "📌 **Как пользоваться:**\n\n"
-        "1. Нажми `/song` или `/video` в меню.\n"
-        "2. Бот попросит ввести название — отправь его текстом.\n"
-        "3. Любые другие сообщения отправляются в ИИ."
+        "📌 **Инструкция:**\n\n"
+        "1. Нажми `/video` и введи название или ссылку → выбери качество на кнопках.\n"
+        "2. Нажми `/song` и введи название → бот сразу пришлет MP3.\n"
+        "3. Любой другой текст — диалог с ИИ."
     )
 
 @dp.message(Command("song"))
 async def cmd_song_init(message: Message, state: FSMContext):
     args = message.text.split(maxsplit=1)
     if len(args) > 1:
-        await process_song_download(message, args[1], state)
+        await start_song_download(message, args[1], state)
     else:
         await state.set_state(DownloadState.waiting_for_song_query)
-        await message.answer("🎵 **Введи название песни или исполнителя:**")
+        await message.answer("🎵 **Введи название песни или ссылку:**")
 
 @dp.message(Command("video"))
 async def cmd_video_init(message: Message, state: FSMContext):
     args = message.text.split(maxsplit=1)
     if len(args) > 1:
-        await process_video_download(message, args[1], state)
+        await show_quality_options(message, args[1], state)
     else:
         await state.set_state(DownloadState.waiting_for_video_query)
-        await message.answer("🎬 **Введи название или тему видео:**")
+        await message.answer("🎬 **Введи название видео или ссылку:**")
 
 # -------------------------------------------------------------------
-# Обработка ввода для скачивания
+# Обработка ввода (FSM)
 # -------------------------------------------------------------------
 @dp.message(DownloadState.waiting_for_song_query)
 async def handle_song_input(message: Message, state: FSMContext):
-    await process_song_download(message, message.text, state)
+    await start_song_download(message, message.text, state)
 
 @dp.message(DownloadState.waiting_for_video_query)
 async def handle_video_input(message: Message, state: FSMContext):
-    await process_video_download(message, message.text, state)
+    await show_quality_options(message, message.text, state)
+
+async def show_quality_options(message: Message, query: str, state: FSMContext):
+    await state.clear()
+    kb = get_quality_keyboard(query)
+    await message.answer(f"🎬 Выбери качество для скачивания:\n**{query}**", reply_markup=kb, parse_mode="Markdown")
+
+async def start_song_download(message: Message, query: str, state: FSMContext):
+    await state.clear()
+    status_msg = await message.answer(f"🔎 Ищу и скачиваю трек: **{query}**...", parse_mode="Markdown")
+    await process_download(status_msg, query, is_audio=True)
 
 # -------------------------------------------------------------------
-# Скачивание и отправка
+# Обработка нажатий на кнопки качества
 # -------------------------------------------------------------------
-async def process_song_download(message: Message, query: str, state: FSMContext):
-    await state.clear()
-    status_msg = await message.answer(f"🔎 Ищу и скачиваю песню: **{query}**...", parse_mode="Markdown")
+@dp.callback_query(F.data.startswith("vid:"))
+async def cb_download_video(callback: CallbackQuery):
+    _, quality, query = callback.data.split(":", 2)
+    await callback.answer(f"Выбрано {quality}p")
+    
+    status_msg = await callback.message.edit_text(
+        f"⏳ Скачиваю видео (**{quality}p**): `{query}`...", 
+        reply_markup=None,
+        parse_mode="Markdown"
+    )
+    await process_download(status_msg, query, quality=quality, is_audio=False)
+
+@dp.callback_query(F.data.startswith("aud:"))
+async def cb_download_audio(callback: CallbackQuery):
+    _, _, query = callback.data.split(":", 2)
+    await callback.answer("Скачиваю MP3")
+    
+    status_msg = await callback.message.edit_text(
+        f"⏳ Скачиваю аудио: `{query}`...", 
+        reply_markup=None,
+        parse_mode="Markdown"
+    )
+    await process_download(status_msg, query, is_audio=True)
+
+# -------------------------------------------------------------------
+# Логика загрузки и отправки в Telegram
+# -------------------------------------------------------------------
+async def process_download(status_msg: Message, query: str, quality: str = None, is_audio: bool = False):
     try:
-        file_path = await download_yt_content(query, is_video=False)
+        file_path = await download_media(query, quality=quality, is_audio=is_audio)
+        
         if file_path and os.path.exists(file_path):
-            audio_file = FSInputFile(file_path)
-            await message.answer_audio(audio=audio_file, caption=f"🎵 {query}")
+            input_file = FSInputFile(file_path)
+            
+            if is_audio:
+                await status_msg.chat.do("upload_voice")
+                await status_msg.answer_audio(audio=input_file, caption=f"🎵 {query}")
+            else:
+                await status_msg.chat.do("upload_video")
+                await status_msg.answer_video(video=input_file, caption=f"🎬 {query} ({quality}p)")
+
             await status_msg.delete()
             os.remove(file_path)
         else:
-            await status_msg.edit_text("Не удалось найти трек или файл превышает 50 МБ.")
+            await status_msg.edit_text("❌ Файл не найден, заблокирован 18+ или превышает лимит Telegram (50 МБ).")
     except TelegramForbiddenError:
         pass
     except Exception as e:
-        print(f"Ошибка YT-DLP: {e}")
+        print(f"Ошибка при скачивании: {e}")
         try:
-            await status_msg.edit_text("Произошла ошибка при скачивании трека.")
-        except TelegramForbiddenError:
-            pass
-
-async def process_video_download(message: Message, query: str, state: FSMContext):
-    await state.clear()
-    status_msg = await message.answer(f"🔎 Ищу и скачиваю видео: **{query}**...", parse_mode="Markdown")
-    try:
-        file_path = await download_yt_content(query, is_video=True)
-        if file_path and os.path.exists(file_path):
-            video_file = FSInputFile(file_path)
-            await message.answer_video(video=video_file, caption=f"🎬 {query}")
-            await status_msg.delete()
-            os.remove(file_path)
-        else:
-            await status_msg.edit_text("Не удалось найти видео или файл превышает 50 МБ.")
-    except TelegramForbiddenError:
-        pass
-    except Exception as e:
-        print(f"Ошибка YT-DLP: {e}")
-        try:
-            await status_msg.edit_text("Произошла ошибка при скачивании видео.")
+            await status_msg.edit_text("❌ Произошла ошибка при скачивании файла.")
         except TelegramForbiddenError:
             pass
 
 # -------------------------------------------------------------------
-# ИИ чат (DeepSeek)
+# Чат с DeepSeek-V3
 # -------------------------------------------------------------------
 @dp.message(F.text)
 async def handle_text(message: Message):
@@ -229,7 +277,7 @@ async def handle_text(message: Message):
                 if not sent_message:
                     sent_message = await message.answer(full_text)
                     last_updated_len = len(full_text)
-                elif len(full_text) - last_updated_len > 20:
+                elif len(full_text) - last_updated_len > 25:
                     await sent_message.edit_text(full_text)
                     last_updated_len = len(full_text)
 
@@ -248,14 +296,14 @@ async def handle_text(message: Message):
             pass
 
 # -------------------------------------------------------------------
-# Запуск
+# Запуск бота
 # -------------------------------------------------------------------
 async def main():
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
 
     await set_bot_commands()
-    print("Бот успешно запущен!")
+    print("🚀 Бот с выбором качества и защитой запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
